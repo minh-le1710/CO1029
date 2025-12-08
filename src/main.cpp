@@ -1,10 +1,13 @@
 #include <Arduino.h>
 #include <DHT.h>
 #include <Adafruit_NeoPixel.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
 // ================== CẤU HÌNH PHẦN CỨNG ==================
 
-// LED đơn cho Task 1 – mình dùng chân R của module RGB
+// LED đơn cho Task 1 – dùng chân R của module RGB
 #define LED_PIN   18
 
 // DHT22 (cảm biến T/H)
@@ -13,27 +16,44 @@
 DHT dht(DHTPIN, DHTTYPE);
 
 // NeoPixel (WS2812) cho Task 2
-// Chân S (DIN) của dải led nối vào NEO_PIN
-#define NEO_PIN    21        // ĐỔI lại nếu bạn cắm vào pin khác
-#define NEO_COUNT  10        // dải của bạn có 10 led
+#define NEO_PIN    21        // DIN của dải 10 led
+#define NEO_COUNT  10
 Adafruit_NeoPixel strip(NEO_COUNT, NEO_PIN, NEO_GRB + NEO_KHZ800);
+
+// OLED I2C cho Task 3
+#define OLED_SDA   8
+#define OLED_SCL   9
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // ================== RTOS HANDLE & BIẾN DÙNG CHUNG ==================
 
-TaskHandle_t      taskHandleSensor   = NULL;
-TaskHandle_t      taskHandleLED      = NULL;
-TaskHandle_t      taskHandleNeoPixel = NULL;
+TaskHandle_t      taskHandleSensor    = NULL;
+TaskHandle_t      taskHandleLED       = NULL;
+TaskHandle_t      taskHandleNeoPixel  = NULL;
+TaskHandle_t      taskHandleOLED      = NULL;
 
-SemaphoreHandle_t xTempSemaphore     = NULL;   // cho Task 1 (LED theo T)
-SemaphoreHandle_t xHumSemaphore      = NULL;   // cho Task 2 (Neo theo H)
+SemaphoreHandle_t xTempSemaphore      = NULL;   // Task 1
+SemaphoreHandle_t xHumSemaphore       = NULL;   // Task 2
+SemaphoreHandle_t xDisplaySemaphore   = NULL;   // Task 3
 
 volatile float g_temperature = 0.0f;
 volatile float g_humidity    = 0.0f;
 
+// Trạng thái hệ thống cho Task 3
+enum SystemState {
+  STATE_NORMAL = 0,
+  STATE_WARNING,
+  STATE_CRITICAL
+};
+
+volatile SystemState g_state = STATE_NORMAL;
+
 // ================== HÀM TIỆN ÍCH CHO LED ĐƠN (TASK 1) ==================
 
 // Nếu LED là common cathode (chân chung GND) thì ON = HIGH.
-// Nếu common anode (chân chung 3V3) thì đổi LED_ACTIVE_HIGH = false.
 const bool LED_ACTIVE_HIGH = true;
 
 void ledOn()
@@ -89,14 +109,12 @@ void patternHot()
 
 // ================== HÀM VẼ THANH ĐỘ ẨM 10 MỨC (TASK 2) ==================
 //
-// Mapping:
-//   - LED 0..2  (mức 1–3):  xanh lá  – độ ẩm thấp (ok)
-//   - LED 3..6  (mức 4–7):  vàng     – trung bình
-//   - LED 7..9  (mức 8–10): đỏ       – ẩm cao / nguy hiểm
+// LED 0..2  (mức 1–3):  xanh lá
+// LED 3..6  (mức 4–7):  vàng
+// LED 7..9  (mức 8–10): đỏ
 //
 void showHumidityBar(float hum)
 {
-  // Quy đổi 0–100% -> 0..NEO_COUNT (0..10)
   int level = (int)round((hum / 100.0f) * NEO_COUNT);
   level = constrain(level, 0, NEO_COUNT);
 
@@ -107,20 +125,16 @@ void showHumidityBar(float hum)
     uint8_t r, g, b;
 
     if (i < 3) {
-      // mức 1-3 → xanh lá
-      r = 0;   g = 255; b = 0;
+      r = 0;   g = 255; b = 0;      // xanh lá
     } else if (i < 7) {
-      // mức 4-7 → vàng
-      r = 255; g = 255; b = 0;
+      r = 255; g = 255; b = 0;      // vàng
     } else {
-      // mức 8-10 → đỏ
-      r = 255; g = 0;   b = 0;
+      r = 255; g = 0;   b = 0;      // đỏ
     }
 
     strip.setPixelColor(i, strip.Color(r, g, b));
   }
 
-  // các led từ "level" tới 9 mặc định là off
   strip.show();
 
   Serial.print("[NeoPixel] hum = ");
@@ -129,11 +143,13 @@ void showHumidityBar(float hum)
   Serial.println(level);
 }
 
-// ================== TASK ĐỌC DHT22 (SENSOR TASK) ==================
+// ================== TASK ĐỌC DHT22 (SENSOR TASK – cho cả 3 Task) ==================
 
 void vTaskSensor(void *pvParameters)
 {
   (void)pvParameters;
+
+  SystemState lastState = STATE_NORMAL;
 
   for (;;)
   {
@@ -143,22 +159,38 @@ void vTaskSensor(void *pvParameters)
     if (isnan(t) || isnan(h))
     {
       Serial.println("[Sensor] Failed to read from DHT22!");
-      // không give semaphore nếu đọc lỗi
     }
     else
     {
       g_temperature = t;
       g_humidity    = h;
 
-      Serial.print("[Sensor] Temperature = ");
+      Serial.print("[Sensor] T = ");
       Serial.print(g_temperature);
-      Serial.print(" *C, Humidity = ");
+      Serial.print(" *C, H = ");
       Serial.print(g_humidity);
       Serial.println(" %");
 
-      // Thông báo cho Task 1 và Task 2
+      // ---- Task 1 & Task 2: give semaphore mỗi lần có dữ liệu hợp lệ ----
       xSemaphoreGive(xTempSemaphore);
       xSemaphoreGive(xHumSemaphore);
+
+      // ---- Task 3: xác định state và chỉ give semaphore khi state thay đổi ----
+      SystemState newState;
+
+      if (t < 30.0f && h < 70.0f)
+        newState = STATE_NORMAL;
+      else if ((t < 35.0f && h < 85.0f))
+        newState = STATE_WARNING;
+      else
+        newState = STATE_CRITICAL;
+
+      if (newState != lastState)
+      {
+        g_state = newState;
+        xSemaphoreGive(xDisplaySemaphore);  // chỉ release khi điều kiện đo thay đổi
+        lastState = newState;
+      }
     }
 
     vTaskDelay(pdMS_TO_TICKS(2000));   // chu kỳ đọc ~2s
@@ -180,22 +212,16 @@ void vTaskLED(void *pvParameters)
     {
       float temp = g_temperature;
 
-      Serial.print("[LED] Received new temperature = ");
+      Serial.print("[LED] New T = ");
       Serial.print(temp);
       Serial.println(" *C");
 
       if (temp < 25.0f)
-      {
         patternCool();
-      }
       else if (temp < 30.0f)
-      {
         patternNormal();
-      }
       else
-      {
         patternHot();
-      }
 
       ledOff();
     }
@@ -209,7 +235,7 @@ void vTaskNeoPixel(void *pvParameters)
   (void)pvParameters;
 
   strip.begin();
-  strip.setBrightness(60);    // giảm chói, có thể chỉnh 0–255
+  strip.setBrightness(60);
   strip.clear();
   strip.show();
 
@@ -218,12 +244,101 @@ void vTaskNeoPixel(void *pvParameters)
     if (xSemaphoreTake(xHumSemaphore, portMAX_DELAY) == pdTRUE)
     {
       float hum = g_humidity;
-      Serial.print("[NeoPixel] Received new humidity = ");
+      Serial.print("[NeoPixel] New H = ");
       Serial.print(hum);
       Serial.println(" %");
 
-      // vẽ thanh mức độ ẩm
       showHumidityBar(hum);
+    }
+  }
+}
+
+// ================== TASK OLED (TASK 3) ==================
+
+void drawStateOnOLED(float t, float h, SystemState st)
+{
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // Dòng 1: T & H
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("T: ");
+  display.print(t, 1);
+  display.print("C  H: ");
+  display.print(h, 0);
+  display.println("%");
+
+  // Dòng 2 & 3: trạng thái
+  display.setCursor(0, 16);
+  display.print("State: ");
+
+  switch (st)
+  {
+    case STATE_NORMAL:
+      display.println("COOL");
+      display.setCursor(0, 28);
+      display.print("GREAT");
+      break;
+
+    case STATE_WARNING:
+      display.println("NORMAL");
+      display.setCursor(0, 28);
+      display.print("OK");
+      break;
+
+    case STATE_CRITICAL:
+      display.println("CRITICAL!");
+      display.setCursor(0, 28);
+      display.print("TAKE ACTION!");
+      // tô 1 khung invert để dễ nhận biết
+      display.fillRect(0, 40, SCREEN_WIDTH, 16, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+      display.setCursor(10, 44);
+      display.print("ALERT");
+      break;
+  }
+
+  display.display();
+}
+
+void vTaskOLED(void *pvParameters)
+{
+  (void)pvParameters;
+
+  // I2C & OLED init
+  Wire.begin(OLED_SDA, OLED_SCL);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
+  {
+    Serial.println("SSD1306 allocation failed");
+    while (1) { delay(1000); }
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("OLED ready...");
+  display.display();
+
+  for (;;)
+  {
+    // Chỉ update khi state thay đổi (semaphore được give từ SensorTask)
+    if (xSemaphoreTake(xDisplaySemaphore, portMAX_DELAY) == pdTRUE)
+    {
+      float t  = g_temperature;
+      float h  = g_humidity;
+      SystemState st = g_state;
+
+      Serial.print("[OLED] Update: T=");
+      Serial.print(t);
+      Serial.print("C, H=");
+      Serial.print(h);
+      Serial.print("%, State=");
+      Serial.println((int)st);
+
+      drawStateOnOLED(t, h, st);
     }
   }
 }
@@ -235,15 +350,16 @@ void setup()
   Serial.begin(115200);
   delay(2000);
 
-  Serial.println("=== Task 1 & Task 2: DHT22 + Single LED (Temp) + NeoPixel 10-level Humidity Bar ===");
+  Serial.println("=== Tasks 1-3: LED (Temp) + NeoPixel (Hum) + OLED (State) ===");
 
   dht.begin();
 
   // Tạo binary semaphore
-  xTempSemaphore = xSemaphoreCreateBinary();
-  xHumSemaphore  = xSemaphoreCreateBinary();
+  xTempSemaphore    = xSemaphoreCreateBinary();
+  xHumSemaphore     = xSemaphoreCreateBinary();
+  xDisplaySemaphore = xSemaphoreCreateBinary();
 
-  if (xTempSemaphore == NULL || xHumSemaphore == NULL)
+  if (!xTempSemaphore || !xHumSemaphore || !xDisplaySemaphore)
   {
     Serial.println("Failed to create semaphores!");
     while (1) { delay(1000); }
@@ -257,12 +373,12 @@ void setup()
     "SensorTask",
     4096,
     NULL,
-    3,                    // ưu tiên cao nhất
+    3,
     &taskHandleSensor
   );
   if (result != pdPASS) Serial.println("Failed to create SensorTask");
 
-  // Task LED theo nhiệt độ (Task 1)
+  // Task LED theo nhiệt độ
   result = xTaskCreate(
     vTaskLED,
     "LEDTask",
@@ -273,7 +389,7 @@ void setup()
   );
   if (result != pdPASS) Serial.println("Failed to create LEDTask");
 
-  // Task NeoPixel theo độ ẩm (Task 2)
+  // Task NeoPixel theo độ ẩm
   result = xTaskCreate(
     vTaskNeoPixel,
     "NeoTask",
@@ -283,10 +399,21 @@ void setup()
     &taskHandleNeoPixel
   );
   if (result != pdPASS) Serial.println("Failed to create NeoTask");
+
+  // Task OLED hiển thị trạng thái
+  result = xTaskCreate(
+    vTaskOLED,
+    "OLEDTask",
+    4096,
+    NULL,
+    1,
+    &taskHandleOLED
+  );
+  if (result != pdPASS) Serial.println("Failed to create OLEDTask");
 }
 
 void loop()
 {
-  // Không dùng loop; mọi thứ chạy trong FreeRTOS task
+  // Không dùng loop; mọi việc chạy trong các task
   vTaskDelay(pdMS_TO_TICKS(1000));
 }
