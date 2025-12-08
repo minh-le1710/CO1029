@@ -1,4 +1,7 @@
 #include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
 #include <DHT.h>
 #include <Adafruit_NeoPixel.h>
 #include <Wire.h>
@@ -28,6 +31,20 @@ Adafruit_NeoPixel strip(NEO_COUNT, NEO_PIN, NEO_GRB + NEO_KHZ800);
 #define OLED_RESET    -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
+// Thiết bị điều khiển qua Web (Task 4)
+#define DEVICE1_PIN 2   // ví dụ: LED 1
+#define DEVICE2_PIN 4   // ví dụ: LED 2
+
+bool device1State = false;
+bool device2State = false;
+
+// ================== WIFI AP + WEBSERVER (TASK 4) ==================
+
+const char* AP_SSID = "ESP32_S3_AP";
+const char* AP_PASS = "12345678";
+
+WebServer server(80);
+
 // ================== RTOS HANDLE & BIẾN DÙNG CHUNG ==================
 
 TaskHandle_t      taskHandleSensor    = NULL;
@@ -51,7 +68,7 @@ enum SystemState {
 
 volatile SystemState g_state = STATE_NORMAL;
 
-// ================== HÀM TIỆN ÍCH CHO LED ĐƠN (TASK 1) ==================
+// ================== TIỆN ÍCH CHO LED ĐƠN (TASK 1) ==================
 
 // Nếu LED là common cathode (chân chung GND) thì ON = HIGH.
 const bool LED_ACTIVE_HIGH = true;
@@ -108,11 +125,7 @@ void patternHot()
 }
 
 // ================== HÀM VẼ THANH ĐỘ ẨM 10 MỨC (TASK 2) ==================
-//
-// LED 0..2  (mức 1–3):  xanh lá
-// LED 3..6  (mức 4–7):  vàng
-// LED 7..9  (mức 8–10): đỏ
-//
+
 void showHumidityBar(float hum)
 {
   int level = (int)round((hum / 100.0f) * NEO_COUNT);
@@ -143,7 +156,7 @@ void showHumidityBar(float hum)
   Serial.println(level);
 }
 
-// ================== TASK ĐỌC DHT22 (SENSOR TASK – cho cả 3 Task) ==================
+// ================== TASK ĐỌC DHT22 (SENSOR – dùng cho 3 Task) ==================
 
 void vTaskSensor(void *pvParameters)
 {
@@ -171,11 +184,11 @@ void vTaskSensor(void *pvParameters)
       Serial.print(g_humidity);
       Serial.println(" %");
 
-      // ---- Task 1 & Task 2: give semaphore mỗi lần có dữ liệu hợp lệ ----
+      // Task 1 & 2
       xSemaphoreGive(xTempSemaphore);
       xSemaphoreGive(xHumSemaphore);
 
-      // ---- Task 3: xác định state và chỉ give semaphore khi state thay đổi ----
+      // Task 3: xác định state & chỉ give khi state đổi
       SystemState newState;
 
       if (t < 30.0f && h < 70.0f)
@@ -188,12 +201,12 @@ void vTaskSensor(void *pvParameters)
       if (newState != lastState)
       {
         g_state = newState;
-        xSemaphoreGive(xDisplaySemaphore);  // chỉ release khi điều kiện đo thay đổi
+        xSemaphoreGive(xDisplaySemaphore);
         lastState = newState;
       }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(2000));   // chu kỳ đọc ~2s
+    vTaskDelay(pdMS_TO_TICKS(2000));
   }
 }
 
@@ -276,22 +289,21 @@ void drawStateOnOLED(float t, float h, SystemState st)
   switch (st)
   {
     case STATE_NORMAL:
-      display.println("COOL");
+      display.println("NORMAL");
       display.setCursor(0, 28);
-      display.print("GREAT");
+      display.print("System OK");
       break;
 
     case STATE_WARNING:
-      display.println("NORMAL");
+      display.println("WARNING");
       display.setCursor(0, 28);
-      display.print("OK");
+      display.print("Check env!");
       break;
 
     case STATE_CRITICAL:
       display.println("CRITICAL!");
       display.setCursor(0, 28);
       display.print("TAKE ACTION!");
-      // tô 1 khung invert để dễ nhận biết
       display.fillRect(0, 40, SCREEN_WIDTH, 16, SSD1306_WHITE);
       display.setTextColor(SSD1306_BLACK);
       display.setCursor(10, 44);
@@ -306,7 +318,6 @@ void vTaskOLED(void *pvParameters)
 {
   (void)pvParameters;
 
-  // I2C & OLED init
   Wire.begin(OLED_SDA, OLED_SCL);
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
@@ -324,7 +335,6 @@ void vTaskOLED(void *pvParameters)
 
   for (;;)
   {
-    // Chỉ update khi state thay đổi (semaphore được give từ SensorTask)
     if (xSemaphoreTake(xDisplaySemaphore, portMAX_DELAY) == pdTRUE)
     {
       float t  = g_temperature;
@@ -343,6 +353,115 @@ void vTaskOLED(void *pvParameters)
   }
 }
 
+// ================== HTML UI (TASK 4) ==================
+
+String htmlPage()
+{
+  String html = F(
+    "<!DOCTYPE html><html><head><meta charset='utf-8'/>"
+    "<meta name='viewport' content='width=device-width, initial-scale=1'/>"
+    "<title>Control Panel</title>"
+    "<style>"
+    "body{font-family:system-ui,Arial;background:#0f172a;color:#e5e7eb;margin:0;padding:0;}"
+    ".wrap{max-width:420px;margin:24px auto;padding:16px;border-radius:16px;"
+      "background:linear-gradient(135deg,#020617,#0b1220);box-shadow:0 18px 40px rgba(15,23,42,0.6);}"
+    "h1{font-size:1.4rem;margin:0 0 8px;color:#f9fafb;text-align:center;}"
+    ".sub{font-size:.8rem;color:#9ca3af;text-align:center;margin-bottom:16px;}"
+    ".card{border-radius:14px;padding:12px 14px;margin-bottom:12px;background:#020617;"
+      "border:1px solid #1f2937;display:flex;justify-content:space-between;align-items:center;}"
+    ".devname{font-weight:600;font-size:.9rem;color:#e5e7eb;}"
+    ".state{font-size:.8rem;padding:4px 10px;border-radius:999px;border:1px solid #374151;}"
+    ".on{background:rgba(22,163,74,.15);color:#bbf7d0;border-color:#15803d;}"
+    ".off{background:rgba(248,113,113,.08);color:#fecaca;border-color:#b91c1c;}"
+    ".btnrow{margin-top:8px;display:flex;gap:8px;}"
+    "a.btn{flex:1;text-align:center;text-decoration:none;font-size:.85rem;font-weight:500;"
+      "border-radius:999px;padding:8px 0;border:1px solid #4b5563;transition:.15s;background:#111827;color:#e5e7eb;}"
+    "a.btn.onb{border-color:#16a34a;background:linear-gradient(135deg,#15803d,#22c55e);color:#ecfdf5;}"
+    "a.btn.offb{border-color:#b91c1c;background:linear-gradient(135deg,#7f1d1d,#ef4444);color:#fef2f2;}"
+    "a.btn:hover{filter:brightness(1.06);}"
+    ".footer{margin-top:12px;font-size:.7rem;color:#6b7280;text-align:center;}"
+    "</style></head><body><div class='wrap'>"
+    "<div class='sub'>Control devices via ESP32-S3 Access Point</div>"
+  );
+
+  // Card Device 1
+  html += F("<div class='card'><div>");
+  html += F("<div class='devname'>Device 1 - LED1</div>");
+  html += F("<div style='font-size:.75rem;color:#9ca3af;'>Green LED</div>");
+  html += F("</div><div class='state ");
+  html += device1State ? F("on'>ON") : F("off'>OFF");
+  html += F("</div></div><div class='btnrow'>");
+  html += F("<a class='btn onb' href='/device1/on'>Turn ON</a>");
+  html += F("<a class='btn offb' href='/device1/off'>Turn OFF</a></div>");
+
+  // Card Device 2
+  html += F("<div class='card'><div>");
+  html += F("<div class='devname'>Device 2 - LED2</div>");
+  html += F("<div style='font-size:.75rem;color:#9ca3af;'>Blue LED</div>");
+  html += F("</div><div class='state ");
+  html += device2State ? F("on'>ON") : F("off'>OFF");
+  html += F("</div></div><div class='btnrow'>");
+  html += F("<a class='btn onb' href='/device2/on'>Turn ON</a>");
+  html += F("<a class='btn offb' href='/device2/off'>Turn OFF</a></div>");
+
+  html += F(
+    "<div class='footer'>ESP32_S3_AP password: 12345678. Refresh page to update state.</div>"
+    "</div></body></html>"
+  );
+
+  return html;
+}
+
+// Cập nhật chân GPIO theo state
+void applyDeviceState()
+{
+  digitalWrite(DEVICE1_PIN, device1State ? HIGH : LOW);
+  digitalWrite(DEVICE2_PIN, device2State ? HIGH : LOW);
+}
+
+// Handlers HTTP
+void handleRoot()
+{
+  server.send(200, "text/html", htmlPage());
+}
+
+void handleDevice1On()
+{
+  device1State = true;
+  applyDeviceState();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleDevice1Off()
+{
+  device1State = false;
+  applyDeviceState();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleDevice2On()
+{
+  device2State = true;
+  applyDeviceState();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleDevice2Off()
+{
+  device2State = false;
+  applyDeviceState();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleNotFound()
+{
+  server.send(404, "text/plain", "Not found");
+}
+
 // ================== SETUP & LOOP ==================
 
 void setup()
@@ -350,11 +469,39 @@ void setup()
   Serial.begin(115200);
   delay(2000);
 
-  Serial.println("=== Tasks 1-3: LED (Temp) + NeoPixel (Hum) + OLED (State) ===");
+  Serial.println("=== Tasks 1-4: LED (Temp) + NeoPixel (Hum) + OLED (State) + WebServer AP ===");
+
+  // --- I/O ---
+  pinMode(DEVICE1_PIN, OUTPUT);
+  pinMode(DEVICE2_PIN, OUTPUT);
+  device1State = false;
+  device2State = false;
+  applyDeviceState();
 
   dht.begin();
 
-  // Tạo binary semaphore
+  // --- WiFi AP ---
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  IPAddress ip = WiFi.softAPIP();
+  Serial.print("AP started. SSID: ");
+  Serial.print(AP_SSID);
+  Serial.print("  Password: ");
+  Serial.print(AP_PASS);
+  Serial.print("  IP: ");
+  Serial.println(ip);
+
+  // --- Web server routes ---
+  server.on("/",          HTTP_GET, handleRoot);
+  server.on("/device1/on",  HTTP_GET, handleDevice1On);
+  server.on("/device1/off", HTTP_GET, handleDevice1Off);
+  server.on("/device2/on",  HTTP_GET, handleDevice2On);
+  server.on("/device2/off", HTTP_GET, handleDevice2Off);
+  server.onNotFound(handleNotFound);
+  server.begin();
+  Serial.println("HTTP server started.");
+
+  // --- Semaphores ---
   xTempSemaphore    = xSemaphoreCreateBinary();
   xHumSemaphore     = xSemaphoreCreateBinary();
   xDisplaySemaphore = xSemaphoreCreateBinary();
@@ -414,6 +561,7 @@ void setup()
 
 void loop()
 {
-  // Không dùng loop; mọi việc chạy trong các task
-  vTaskDelay(pdMS_TO_TICKS(1000));
+  // Task loop dành cho WebServer (Task 4)
+  server.handleClient();
+  vTaskDelay(pdMS_TO_TICKS(10));   // nhường CPU cho các task RTOS khác
 }
