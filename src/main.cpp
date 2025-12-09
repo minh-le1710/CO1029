@@ -8,6 +8,8 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
+#include "tinyml_model.h"
+
 // ================== CẤU HÌNH PHẦN CỨNG ==================
 
 // LED đơn cho Task 1 – dùng chân R của module RGB
@@ -88,7 +90,7 @@ void ledOff()
 // COOL: T < 25°C  → nháy chậm, 2 lần
 void patternCool()
 {
-  Serial.println("[LED] Mode: COOL (slow blink, 2 times)");
+  // Serial.println("[LED] Mode: COOL (slow blink, 2 times)");
   for (int i = 0; i < 2; ++i)
   {
     ledOn();
@@ -101,7 +103,7 @@ void patternCool()
 // NORMAL: 25°C ≤ T < 30°C → nháy trung bình, 4 lần
 void patternNormal()
 {
-  Serial.println("[LED] Mode: NORMAL (medium blink, 4 times)");
+  // Serial.println("[LED] Mode: NORMAL (medium blink, 4 times)");
   for (int i = 0; i < 4; ++i)
   {
     ledOn();
@@ -114,7 +116,7 @@ void patternNormal()
 // HOT: T ≥ 30°C → nháy nhanh, 6 lần
 void patternHot()
 {
-  Serial.println("[LED] Mode: HOT (fast blink, 6 times)");
+  // Serial.println("[LED] Mode: HOT (fast blink, 6 times)");
   for (int i = 0; i < 6; ++i)
   {
     ledOn();
@@ -150,10 +152,10 @@ void showHumidityBar(float hum)
 
   strip.show();
 
-  Serial.print("[NeoPixel] hum = ");
-  Serial.print(hum);
-  Serial.print(" %, level = ");
-  Serial.println(level);
+  // Serial.print("[NeoPixel] hum = ");
+  // Serial.print(hum);
+  // Serial.print(" %, level = ");
+  // Serial.println(level);
 }
 
 // ================== TASK ĐỌC DHT22 (SENSOR – dùng cho 3 Task) ==================
@@ -171,32 +173,35 @@ void vTaskSensor(void *pvParameters)
 
     if (isnan(t) || isnan(h))
     {
-      Serial.println("[Sensor] Failed to read from DHT22!");
+      // Nếu muốn im lặng hoàn toàn thì comment dòng này
+      // Serial.println("[Sensor] Failed to read from DHT22!");
     }
     else
     {
       g_temperature = t;
       g_humidity    = h;
 
-      Serial.print("[Sensor] T = ");
-      Serial.print(g_temperature);
-      Serial.print(" *C, H = ");
-      Serial.print(g_humidity);
-      Serial.println(" %");
+      // ==== LOG DỮ LIỆU CHO DATASET (Task 5) ====
+      // Format: DATA,<temp>,<hum>
+      Serial.print("DATA,");
+      Serial.print(t, 2);   // 2 chữ số sau dấu phẩy
+      Serial.print(",");
+      Serial.println(h, 2);
+      // ==========================================
 
-      // Task 1 & 2
+      // ---- Task 1 & 2: báo cho LED và NeoPixel ----
       xSemaphoreGive(xTempSemaphore);
       xSemaphoreGive(xHumSemaphore);
 
-      // Task 3: xác định state & chỉ give khi state đổi
-      SystemState newState;
+      // ---- Task 3: xác định state & chỉ give khi state đổi ----
 
-      if (t < 30.0f && h < 70.0f)
-        newState = STATE_NORMAL;
-      else if ((t < 35.0f && h < 85.0f))
-        newState = STATE_WARNING;
-      else
-        newState = STATE_CRITICAL;
+      int label = tinyml_predict(t, h);   // nhãn gốc từ model (0,1,2)
+
+      SystemState newState = STATE_NORMAL;
+      if (label == 0)      newState = STATE_NORMAL;
+      else if (label == 1) newState = STATE_WARNING;
+      else if (label == 2) newState = STATE_CRITICAL;
+      else                 newState = STATE_NORMAL; // fallback
 
       if (newState != lastState)
       {
@@ -206,7 +211,7 @@ void vTaskSensor(void *pvParameters)
       }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    vTaskDelay(pdMS_TO_TICKS(2000));   // đọc DHT mỗi 2 giây
   }
 }
 
@@ -225,9 +230,9 @@ void vTaskLED(void *pvParameters)
     {
       float temp = g_temperature;
 
-      Serial.print("[LED] New T = ");
-      Serial.print(temp);
-      Serial.println(" *C");
+      // Serial.print("[LED] New T = ");
+      // Serial.print(temp);
+      // Serial.println(" *C");
 
       if (temp < 25.0f)
         patternCool();
@@ -257,9 +262,9 @@ void vTaskNeoPixel(void *pvParameters)
     if (xSemaphoreTake(xHumSemaphore, portMAX_DELAY) == pdTRUE)
     {
       float hum = g_humidity;
-      Serial.print("[NeoPixel] New H = ");
-      Serial.print(hum);
-      Serial.println(" %");
+      // Serial.print("[NeoPixel] New H = ");
+      // Serial.print(hum);
+      // Serial.println(" %");
 
       showHumidityBar(hum);
     }
@@ -322,7 +327,7 @@ void vTaskOLED(void *pvParameters)
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
   {
-    Serial.println("SSD1306 allocation failed");
+    // Serial.println("SSD1306 allocation failed");
     while (1) { delay(1000); }
   }
 
@@ -341,12 +346,12 @@ void vTaskOLED(void *pvParameters)
       float h  = g_humidity;
       SystemState st = g_state;
 
-      Serial.print("[OLED] Update: T=");
-      Serial.print(t);
-      Serial.print("C, H=");
-      Serial.print(h);
-      Serial.print("%, State=");
-      Serial.println((int)st);
+      // Serial.print("[OLED] Update: T=");
+      // Serial.print(t);
+      // Serial.print("C, H=");
+      // Serial.print(h);
+      // Serial.print("%, State=");
+      // Serial.println((int)st);
 
       drawStateOnOLED(t, h, st);
     }
@@ -469,7 +474,7 @@ void setup()
   Serial.begin(115200);
   delay(2000);
 
-  Serial.println("=== Tasks 1-4: LED (Temp) + NeoPixel (Hum) + OLED (State) + WebServer AP ===");
+  // Serial.println("=== Tasks 1-4: LED (Temp) + NeoPixel (Hum) + OLED (State) + WebServer AP ===");
 
   // --- I/O ---
   pinMode(DEVICE1_PIN, OUTPUT);
@@ -483,23 +488,23 @@ void setup()
   // --- WiFi AP ---
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
-  IPAddress ip = WiFi.softAPIP();
-  Serial.print("AP started. SSID: ");
-  Serial.print(AP_SSID);
-  Serial.print("  Password: ");
-  Serial.print(AP_PASS);
-  Serial.print("  IP: ");
-  Serial.println(ip);
+  // IPAddress ip = WiFi.softAPIP();
+  // Serial.print("AP started. SSID: ");
+  // Serial.print(AP_SSID);
+  // Serial.print("  Password: ");
+  // Serial.print(AP_PASS);
+  // Serial.print("  IP: ");
+  // Serial.println(ip);
 
   // --- Web server routes ---
-  server.on("/",          HTTP_GET, handleRoot);
+  server.on("/",            HTTP_GET, handleRoot);
   server.on("/device1/on",  HTTP_GET, handleDevice1On);
   server.on("/device1/off", HTTP_GET, handleDevice1Off);
   server.on("/device2/on",  HTTP_GET, handleDevice2On);
   server.on("/device2/off", HTTP_GET, handleDevice2Off);
   server.onNotFound(handleNotFound);
   server.begin();
-  Serial.println("HTTP server started.");
+  // Serial.println("HTTP server started.");
 
   // --- Semaphores ---
   xTempSemaphore    = xSemaphoreCreateBinary();
@@ -508,7 +513,7 @@ void setup()
 
   if (!xTempSemaphore || !xHumSemaphore || !xDisplaySemaphore)
   {
-    Serial.println("Failed to create semaphores!");
+    // Serial.println("Failed to create semaphores!");
     while (1) { delay(1000); }
   }
 
@@ -523,7 +528,7 @@ void setup()
     3,
     &taskHandleSensor
   );
-  if (result != pdPASS) Serial.println("Failed to create SensorTask");
+  // if (result != pdPASS) Serial.println("Failed to create SensorTask");
 
   // Task LED theo nhiệt độ
   result = xTaskCreate(
@@ -534,7 +539,7 @@ void setup()
     2,
     &taskHandleLED
   );
-  if (result != pdPASS) Serial.println("Failed to create LEDTask");
+  // if (result != pdPASS) Serial.println("Failed to create LEDTask");
 
   // Task NeoPixel theo độ ẩm
   result = xTaskCreate(
@@ -545,7 +550,7 @@ void setup()
     1,
     &taskHandleNeoPixel
   );
-  if (result != pdPASS) Serial.println("Failed to create NeoTask");
+  // if (result != pdPASS) Serial.println("Failed to create NeoTask");
 
   // Task OLED hiển thị trạng thái
   result = xTaskCreate(
@@ -556,7 +561,7 @@ void setup()
     1,
     &taskHandleOLED
   );
-  if (result != pdPASS) Serial.println("Failed to create OLEDTask");
+  // if (result != pdPASS) Serial.println("Failed to create OLEDTask");
 }
 
 void loop()
